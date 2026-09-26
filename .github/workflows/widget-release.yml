@@ -1,0 +1,40 @@
+name: Widget catalog release
+run-name: ${{ inputs.helio_execution_id }}
+'on':
+  workflow_dispatch:
+    inputs:
+      helio_execution_id:
+        type: string
+        required: false
+        default: ''
+        description: ''
+      helio_target_environment:
+        type: string
+        required: false
+        default: ''
+        description: Empty for normal fan-out; exact catalog key for deployment-only recovery
+  push:
+    branches:
+    - main
+permissions:
+  contents: write
+  packages: write
+jobs:
+  artifact:
+    name: Artifact
+    uses: jquantum-helio-qa/helio-catalog-artifact-qa-20260926/.github/workflows/catalog-build.yml@19e4271ab17df84f91f8cc7abed8c78ad8289e33
+    with:
+      helio_execution_id: ${{ inputs.helio_execution_id || '' }}
+      helio_target_environment: ${{ inputs.helio_target_environment || '' }}
+      build_runner: '["self-hosted","helio-catalog-artifact-qa"]'
+      image_repository: ghcr.io/jquantum-helio-qa/helio-catalog-artifact-qa-20260926
+    secrets: inherit
+  deploy:
+    name: Deploy
+    needs:
+    - artifact
+    uses: jquantum-helio-qa/helio-catalog-artifact-qa-20260926/.github/workflows/catalog-deploy.yml@19e4271ab17df84f91f8cc7abed8c78ad8289e33
+    with:
+      helio_execution_id: ${{ inputs.helio_execution_id || '' }}
+      helio_target_environment: ${{ inputs.helio_target_environment || '' }}
+    secrets: inherit
