@@ -27,7 +27,7 @@ jobs:
       helio_execution_id: ${{ inputs.helio_execution_id || '' }}
       helio_target_environment: ${{ inputs.helio_target_environment || '' }}
       build_runner: '["self-hosted","helio-catalog-artifact-qa"]'
-      image_repository: ghcr.io/jquantum-helio-qa/helio-catalog-artifact-qa-20260926
+      image_repository: ghcr.io/${{ github.repository }}
     secrets: inherit
   deploy:
     name: Deploy
