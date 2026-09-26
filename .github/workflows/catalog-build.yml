@@ -1,0 +1,441 @@
+name: Catalog immutable artifact
+'on':
+  workflow_call:
+    inputs:
+      helio_execution_id:
+        type: string
+        required: false
+        default: ''
+        description: ''
+      helio_target_environment:
+        type: string
+        required: false
+        default: ''
+        description: Empty for normal fan-out; exact catalog key for deployment-only recovery
+      build_runner:
+        type: string
+        required: false
+        default: '["self-hosted","helio-catalog-artifact-qa"]'
+        description: ''
+      image_repository:
+        type: string
+        required: false
+        default: ''
+        description: ''
+      build_adapter:
+        type: string
+        required: false
+        default: cicd/helio-build.sh
+        description: ''
+    outputs:
+      artifact_uri:
+        value: ${{ jobs.artifact.outputs.artifact_uri }}
+      artifact_digest:
+        value: ${{ jobs.artifact.outputs.artifact_digest }}
+      build_version:
+        value: ${{ jobs.artifact.outputs.build_version }}
+permissions:
+  contents: write
+  packages: write
+jobs:
+  artifact:
+    name: Resolve immutable artifact
+    runs-on: ${{ fromJSON(inputs.build_runner) }}
+    outputs:
+      artifact_uri: ${{ steps.resolve.outputs.artifact_uri || steps.publish.outputs.artifact_uri }}
+      artifact_digest: ${{ steps.resolve.outputs.artifact_digest || steps.publish.outputs.artifact_digest }}
+      build_version: ${{ steps.resolve.outputs.build_version || steps.publish.outputs.build_version }}
+    env:
+      CATALOG_PLAN: ${{ vars.HELIO_ENVIRONMENTS }}
+      SELECTED_ENVIRONMENT: ${{ inputs.helio_target_environment }}
+    steps:
+    - name: Resolve durable catalog state
+      id: resolve
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+      with:
+        script: |
+          const loaded = {exports: {}};
+          (function(module) {
+          'use strict';
+          // Embedded verbatim in pinned reusable workflows by generate.py. No fetch/eval
+          // of runtime code, no secret data in durable records, no force-updated refs.
+          const crypto = require('node:crypto');
+          const fail = code => { throw Error('catalog_' + code); };
+          function canonical(x) {
+            if (Array.isArray(x)) return '[' + x.map(canonical).join(',') + ']';
+            if (x && typeof x === 'object') return '{' + Object.keys(x).sort().map(k => JSON.stringify(k) + ':' + canonical(x[k])).join(',') + '}';
+            return JSON.stringify(x);
+          }
+          const hash = x => crypto.createHash('sha256').update(canonical(x)).digest('hex');
+          const shaOK = x => typeof x === 'string' && /^[a-f0-9]{40}$/.test(x);
+          const envOK = x => typeof x === 'string' && /^[a-z0-9][a-z0-9._-]{0,62}$/.test(x) && !x.includes('..');
+          function scopeOK(s) {
+            if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(s.repository || '') ||
+                !/^[1-9][0-9]{0,19}$/.test(s.repository_id || '') || !shaOK(s.commit) ||
+                !/^[1-9][0-9]{0,19}$/.test(s.run_id || '') || !/^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/.test(s.workflow_path || '') ||
+                !Number.isSafeInteger(s.run_attempt) || s.run_attempt < 1) fail('scope_invalid');
+          }
+          function validatePlan(p, target) {
+            const stages = ['qa','preprod','production'];
+            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > 3 ||
+                new Set(p.order).size !== p.order.length || p.order.some(x => !stages.includes(x)) ||
+                canonical(p.order) !== canonical(stages.filter(x => p.order.includes(x))) ||
+                !p.runs_on || typeof p.runs_on !== 'object') fail('plan_invalid');
+            const seen = new Set();
+            for (const stage of p.order) {
+              if (!Array.isArray(p[stage]) || p[stage].length > 100) fail('plan_invalid');
+              for (const e of p[stage]) {
+                if (!envOK(e) || seen.has(e)) fail('plan_invalid');
+                seen.add(e);
+                const labels = Array.isArray(p.runs_on[e]) ? p.runs_on[e] : [p.runs_on[e]];
+                if (!labels.length || labels.length > 20 || labels.some(v => typeof v !== 'string' || !/^[A-Za-z0-9_. -]{1,100}$/.test(v))) fail('plan_invalid');
+              }
+            }
+            if (!seen.size || seen.size > 256 || Object.keys(p).some(k => !['order','runs_on',...p.order].includes(k)) ||
+                Object.keys(p.runs_on).some(k => !seen.has(k))) fail('plan_invalid');
+            if (target && !seen.has(target)) fail('target_not_in_plan');
+            return p;
+          }
+          function validateArtifact(a) {
+            if (!a || Object.keys(a).sort().join(',') !== 'artifact_digest,artifact_uri,build_version' ||
+                !/^sha256:[a-f0-9]{64}$/.test(a.artifact_digest || '') ||
+                !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,500}@sha256:[a-f0-9]{64}$/.test(a.artifact_uri || '') ||
+                !a.artifact_uri.endsWith('@' + a.artifact_digest) ||
+                typeof a.build_version !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(a.build_version)) fail('artifact_invalid');
+            return a;
+          }
+          function path(s) { scopeOK(s); return '/repos/' + s.repository; }
+          function nameOK(n) { if (!/^(artifacts|build-intents|plans|intents|receipts|target-locks)\/[A-Za-z0-9/_-]{1,180}$/.test(n) || n.includes('..')) fail('record_name'); }
+          async function read(api, s, name, otherCommit = false) {
+            nameOK(name); let ref;
+            try { ref = await api('GET', path(s) + '/git/ref/tags/helio/catalog/' + name); }
+            catch (e) { if (e.status === 404) return null; throw e; }
+            if (ref?.object?.type !== 'tag' || !shaOK(ref.object.sha)) fail('record_ref');
+            const tag = await api('GET', path(s) + '/git/tags/' + ref.object.sha);
+            if (tag.sha !== ref.object.sha || tag.object?.type !== 'commit' || typeof tag.message !== 'string' || Buffer.byteLength(tag.message) > 100000) fail('record_ref');
+            let body; try { body = JSON.parse(tag.message); } catch { fail('record_json'); }
+            if (body.schema !== 'helio_catalog_artifact_v1' || body.repository !== s.repository || body.repository_id !== s.repository_id ||
+                body.name !== name || !shaOK(body.commit) || tag.object.sha !== body.commit ||
+                (!otherCommit && (body.commit !== s.commit || body.workflow_path !== s.workflow_path))) fail('record_scope');
+            if (!body.value || hash(body.value) !== body.digest) fail('record_digest');
+            return {value: body.value, ref_sha: ref.object.sha, commit: body.commit};
+          }
+          async function put(api, s, name, value, exclusive = false) {
+            const old = await read(api, s, name, name.startsWith('target-locks/'));
+            if (old) {
+              if (exclusive) fail(name.startsWith('target-locks/') ? 'target_locked' : 'build_uncertain');
+              if (canonical(old.value) !== canonical(value)) fail('record_conflict');
+              return old;
+            }
+            const body = {schema:'helio_catalog_artifact_v1',repository:s.repository,repository_id:s.repository_id,workflow_path:s.workflow_path,commit:s.commit,name,value,digest:hash(value)};
+            const tag = await api('POST', path(s) + '/git/tags', {tag:'helio/catalog/' + name,message:canonical(body),object:s.commit,type:'commit'});
+            if (!shaOK(tag.sha)) fail('record_ref');
+            try { await api('POST', path(s) + '/git/refs', {ref:'refs/tags/helio/catalog/' + name,sha:tag.sha}); }
+            catch (e) {
+              if (![409,422].includes(e.status)) throw e;
+              const winner = await read(api, s, name, name.startsWith('target-locks/'));
+              if (exclusive) fail(name.startsWith('target-locks/') ? 'target_locked' : 'build_uncertain');
+              if (!winner || canonical(winner.value) !== canonical(value)) fail('record_conflict');
+              return winner;
+            }
+            return {value,ref_sha:tag.sha,commit:s.commit};
+          }
+          const execution = s => ({run_id:s.run_id,run_attempt:s.run_attempt,commit:s.commit});
+          const artifactName = s => 'artifacts/' + hash(s.workflow_path) + '/' + s.commit;
+          const buildIntentName = s => 'build-intents/' + hash(s.workflow_path) + '/' + s.commit;
+          const planName = s => 'plans/' + s.run_id;
+          const targetKey = target => hash(target);
+          const scopedName = (kind,s,target) => `${kind}/${s.run_id}/${s.run_attempt}/${targetKey(target)}`;
+          const operationId = (s,target) => hash({...s,environment:target});
+          async function assertPlan(api,s,plan,target) {
+            validatePlan(plan,target);
+            const retained = await read(api,s,planName(s));
+            if (!retained || canonical(retained.value.plan) !== canonical(plan)) fail('plan_drift');
+          }
+          async function resolve(api,s,plan,target) {
+            scopeOK(s);validatePlan(plan,target);
+            // Missing recovery artifact causes no mutation and never a build.
+            const prior = await read(api,s,artifactName(s));
+            if (target && !prior) fail('artifact_missing');
+            await put(api,s,planName(s),{plan});
+            if (prior) return {build_required:false,artifact:validateArtifact(prior.value.artifact)};
+            await put(api,s,buildIntentName(s),execution(s),true);
+            return {build_required:true};
+          }
+          async function publish(api,s,artifact) {
+            validateArtifact(artifact);
+            const intent = await read(api,s,buildIntentName(s));
+            if (!intent || canonical(intent.value) !== canonical(execution(s))) fail('build_owner');
+            const result = await put(api,s,artifactName(s),{artifact,builder:execution(s)});
+            return result.value.artifact;
+          }
+          async function unlock(api,s,target,operation) {
+            const name='target-locks/' + targetKey(target), lock=await read(api,s,name,true);
+            if (!lock) return;
+            if (lock.value.operation_id !== operation) fail('target_owner_changed');
+            // The identical GitHub concurrency group serializes release of this ref with
+            // the next target job. Never delete another execution's observed lock.
+            await api('DELETE',path(s) + '/git/refs/tags/helio/catalog/' + name);
+          }
+          async function prepare(api,s,plan,target,selection) {
+            if (!envOK(target) || (selection && selection !== target)) fail('target_scope');
+            await assertPlan(api,s,plan,target);
+            const record=await read(api,s,artifactName(s));if(!record)fail('artifact_missing');
+            const artifact=validateArtifact(record.value.artifact), id=operationId(s,target);
+            const receipt=await read(api,s,scopedName('receipts',s,target));
+            if(receipt){
+              if(receipt.value.operation_id!==id || canonical(receipt.value.artifact)!==canonical(artifact))fail('record_conflict');
+              const lock=await read(api,s,'target-locks/'+targetKey(target),true);
+              if(lock?.value.operation_id===id)await unlock(api,s,target,id);
+              return {deploy_required:false,artifact,operation_id:id};
+            }
+            if(await read(api,s,scopedName('intents',s,target)))fail('deployment_uncertain');
+            const intent={...execution(s),environment:target,operation_id:id,artifact,plan_digest:hash(plan)};
+            await put(api,s,'target-locks/'+targetKey(target),intent,true);
+            await put(api,s,scopedName('intents',s,target),intent);
+            return {deploy_required:true,artifact,operation_id:id};
+          }
+          async function complete(api,s,plan,target,observed) {
+            await assertPlan(api,s,plan,target);
+            const intent=await read(api,s,scopedName('intents',s,target));
+            const lock=await read(api,s,'target-locks/'+targetKey(target),true);
+            if(!intent || !lock || lock.value.operation_id!==intent.value.operation_id)fail('target_owner_changed');
+            const value=intent.value;
+            if(observed?.operation_id!==value.operation_id || observed.environment!==target ||
+                observed.observed_artifact_digest!==value.artifact.artifact_digest)fail('deployment_verification');
+            await put(api,s,scopedName('receipts',s,target),{...value,observed_artifact_digest:observed.observed_artifact_digest});
+            await unlock(api,s,target,value.operation_id);
+            return value;
+          }
+          async function main({github,context,core},phase) {
+            const e=process.env;
+            const workflow=(e.GITHUB_WORKFLOW_REF||'').slice((e.GITHUB_REPOSITORY||'').length+1).split('@')[0];
+            const s={repository:e.GITHUB_REPOSITORY,repository_id:String(context.payload.repository.id),workflow_path:workflow,commit:e.GITHUB_SHA,run_id:e.GITHUB_RUN_ID,run_attempt:Number(e.GITHUB_RUN_ATTEMPT)};
+            const api=async(method,url,body)=> (await github.request(method+' '+url,{...body,request:{timeout:10000}})).data;
+            let p;try{p=JSON.parse(e.CATALOG_PLAN);}catch{fail('plan_invalid');}
+            const target=e.TARGET_ENVIRONMENT||'',selection=e.SELECTED_ENVIRONMENT||'';
+            let result;
+            if(phase==='resolve')result=await resolve(api,s,p,selection);
+            else if(phase==='publish'){
+              const artifact=JSON.parse(require('node:fs').readFileSync(e.RESULT_FILE,'utf8'));
+              result={artifact:await publish(api,s,artifact)};
+            } else if(phase==='prepare')result=await prepare(api,s,p,target,selection);
+            else if(phase==='complete'){
+              const observed=JSON.parse(require('node:fs').readFileSync(e.RESULT_FILE,'utf8'));
+              result=await complete(api,s,p,target,observed);
+            } else fail('phase_invalid');
+            for(const [key,value]of Object.entries(result||{}))core.setOutput(key,typeof value==='object'?canonical(value):String(value));
+            if(result.artifact)for(const [key,value]of Object.entries(result.artifact))core.setOutput(key,value);
+          }
+          module.exports={canonical,hash,validatePlan,validateArtifact,resolve,publish,prepare,complete,main};
+
+          })(loaded);
+          await loaded.exports.main({github, context, core}, 'resolve');
+        retries: 0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      if: ${{ steps.resolve.outputs.build_required == 'true' }}
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+    - name: Build and publish exactly once
+      if: ${{ steps.resolve.outputs.build_required == 'true' }}
+      shell: bash
+      env:
+        RESULT_FILE: ${{ runner.temp }}/helio-build-result-${{ github.run_id }}-${{ github.run_attempt }}.json
+        ADAPTER: ${{ inputs.build_adapter }}
+        IMAGE_REPOSITORY: ${{ inputs.image_repository }}
+        REGISTRY_TOKEN: ${{ github.token }}
+        REGISTRY_USER: ${{ github.actor }}
+      run: |
+        set -euo pipefail
+        [[ "$ADAPTER" =~ ^cicd/[A-Za-z0-9_-]+[.]sh$ ]]
+        test -f "$ADAPTER"
+        rm -f -- "$RESULT_FILE"
+        bash "$ADAPTER"
+        test -s "$RESULT_FILE"
+    - name: Publish durable catalog state
+      id: publish
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+      with:
+        script: |
+          const loaded = {exports: {}};
+          (function(module) {
+          'use strict';
+          // Embedded verbatim in pinned reusable workflows by generate.py. No fetch/eval
+          // of runtime code, no secret data in durable records, no force-updated refs.
+          const crypto = require('node:crypto');
+          const fail = code => { throw Error('catalog_' + code); };
+          function canonical(x) {
+            if (Array.isArray(x)) return '[' + x.map(canonical).join(',') + ']';
+            if (x && typeof x === 'object') return '{' + Object.keys(x).sort().map(k => JSON.stringify(k) + ':' + canonical(x[k])).join(',') + '}';
+            return JSON.stringify(x);
+          }
+          const hash = x => crypto.createHash('sha256').update(canonical(x)).digest('hex');
+          const shaOK = x => typeof x === 'string' && /^[a-f0-9]{40}$/.test(x);
+          const envOK = x => typeof x === 'string' && /^[a-z0-9][a-z0-9._-]{0,62}$/.test(x) && !x.includes('..');
+          function scopeOK(s) {
+            if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(s.repository || '') ||
+                !/^[1-9][0-9]{0,19}$/.test(s.repository_id || '') || !shaOK(s.commit) ||
+                !/^[1-9][0-9]{0,19}$/.test(s.run_id || '') || !/^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/.test(s.workflow_path || '') ||
+                !Number.isSafeInteger(s.run_attempt) || s.run_attempt < 1) fail('scope_invalid');
+          }
+          function validatePlan(p, target) {
+            const stages = ['qa','preprod','production'];
+            if (!p || !Array.isArray(p.order) || !p.order.length || p.order.length > 3 ||
+                new Set(p.order).size !== p.order.length || p.order.some(x => !stages.includes(x)) ||
+                canonical(p.order) !== canonical(stages.filter(x => p.order.includes(x))) ||
+                !p.runs_on || typeof p.runs_on !== 'object') fail('plan_invalid');
+            const seen = new Set();
+            for (const stage of p.order) {
+              if (!Array.isArray(p[stage]) || p[stage].length > 100) fail('plan_invalid');
+              for (const e of p[stage]) {
+                if (!envOK(e) || seen.has(e)) fail('plan_invalid');
+                seen.add(e);
+                const labels = Array.isArray(p.runs_on[e]) ? p.runs_on[e] : [p.runs_on[e]];
+                if (!labels.length || labels.length > 20 || labels.some(v => typeof v !== 'string' || !/^[A-Za-z0-9_. -]{1,100}$/.test(v))) fail('plan_invalid');
+              }
+            }
+            if (!seen.size || seen.size > 256 || Object.keys(p).some(k => !['order','runs_on',...p.order].includes(k)) ||
+                Object.keys(p.runs_on).some(k => !seen.has(k))) fail('plan_invalid');
+            if (target && !seen.has(target)) fail('target_not_in_plan');
+            return p;
+          }
+          function validateArtifact(a) {
+            if (!a || Object.keys(a).sort().join(',') !== 'artifact_digest,artifact_uri,build_version' ||
+                !/^sha256:[a-f0-9]{64}$/.test(a.artifact_digest || '') ||
+                !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,500}@sha256:[a-f0-9]{64}$/.test(a.artifact_uri || '') ||
+                !a.artifact_uri.endsWith('@' + a.artifact_digest) ||
+                typeof a.build_version !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(a.build_version)) fail('artifact_invalid');
+            return a;
+          }
+          function path(s) { scopeOK(s); return '/repos/' + s.repository; }
+          function nameOK(n) { if (!/^(artifacts|build-intents|plans|intents|receipts|target-locks)\/[A-Za-z0-9/_-]{1,180}$/.test(n) || n.includes('..')) fail('record_name'); }
+          async function read(api, s, name, otherCommit = false) {
+            nameOK(name); let ref;
+            try { ref = await api('GET', path(s) + '/git/ref/tags/helio/catalog/' + name); }
+            catch (e) { if (e.status === 404) return null; throw e; }
+            if (ref?.object?.type !== 'tag' || !shaOK(ref.object.sha)) fail('record_ref');
+            const tag = await api('GET', path(s) + '/git/tags/' + ref.object.sha);
+            if (tag.sha !== ref.object.sha || tag.object?.type !== 'commit' || typeof tag.message !== 'string' || Buffer.byteLength(tag.message) > 100000) fail('record_ref');
+            let body; try { body = JSON.parse(tag.message); } catch { fail('record_json'); }
+            if (body.schema !== 'helio_catalog_artifact_v1' || body.repository !== s.repository || body.repository_id !== s.repository_id ||
+                body.name !== name || !shaOK(body.commit) || tag.object.sha !== body.commit ||
+                (!otherCommit && (body.commit !== s.commit || body.workflow_path !== s.workflow_path))) fail('record_scope');
+            if (!body.value || hash(body.value) !== body.digest) fail('record_digest');
+            return {value: body.value, ref_sha: ref.object.sha, commit: body.commit};
+          }
+          async function put(api, s, name, value, exclusive = false) {
+            const old = await read(api, s, name, name.startsWith('target-locks/'));
+            if (old) {
+              if (exclusive) fail(name.startsWith('target-locks/') ? 'target_locked' : 'build_uncertain');
+              if (canonical(old.value) !== canonical(value)) fail('record_conflict');
+              return old;
+            }
+            const body = {schema:'helio_catalog_artifact_v1',repository:s.repository,repository_id:s.repository_id,workflow_path:s.workflow_path,commit:s.commit,name,value,digest:hash(value)};
+            const tag = await api('POST', path(s) + '/git/tags', {tag:'helio/catalog/' + name,message:canonical(body),object:s.commit,type:'commit'});
+            if (!shaOK(tag.sha)) fail('record_ref');
+            try { await api('POST', path(s) + '/git/refs', {ref:'refs/tags/helio/catalog/' + name,sha:tag.sha}); }
+            catch (e) {
+              if (![409,422].includes(e.status)) throw e;
+              const winner = await read(api, s, name, name.startsWith('target-locks/'));
+              if (exclusive) fail(name.startsWith('target-locks/') ? 'target_locked' : 'build_uncertain');
+              if (!winner || canonical(winner.value) !== canonical(value)) fail('record_conflict');
+              return winner;
+            }
+            return {value,ref_sha:tag.sha,commit:s.commit};
+          }
+          const execution = s => ({run_id:s.run_id,run_attempt:s.run_attempt,commit:s.commit});
+          const artifactName = s => 'artifacts/' + hash(s.workflow_path) + '/' + s.commit;
+          const buildIntentName = s => 'build-intents/' + hash(s.workflow_path) + '/' + s.commit;
+          const planName = s => 'plans/' + s.run_id;
+          const targetKey = target => hash(target);
+          const scopedName = (kind,s,target) => `${kind}/${s.run_id}/${s.run_attempt}/${targetKey(target)}`;
+          const operationId = (s,target) => hash({...s,environment:target});
+          async function assertPlan(api,s,plan,target) {
+            validatePlan(plan,target);
+            const retained = await read(api,s,planName(s));
+            if (!retained || canonical(retained.value.plan) !== canonical(plan)) fail('plan_drift');
+          }
+          async function resolve(api,s,plan,target) {
+            scopeOK(s);validatePlan(plan,target);
+            // Missing recovery artifact causes no mutation and never a build.
+            const prior = await read(api,s,artifactName(s));
+            if (target && !prior) fail('artifact_missing');
+            await put(api,s,planName(s),{plan});
+            if (prior) return {build_required:false,artifact:validateArtifact(prior.value.artifact)};
+            await put(api,s,buildIntentName(s),execution(s),true);
+            return {build_required:true};
+          }
+          async function publish(api,s,artifact) {
+            validateArtifact(artifact);
+            const intent = await read(api,s,buildIntentName(s));
+            if (!intent || canonical(intent.value) !== canonical(execution(s))) fail('build_owner');
+            const result = await put(api,s,artifactName(s),{artifact,builder:execution(s)});
+            return result.value.artifact;
+          }
+          async function unlock(api,s,target,operation) {
+            const name='target-locks/' + targetKey(target), lock=await read(api,s,name,true);
+            if (!lock) return;
+            if (lock.value.operation_id !== operation) fail('target_owner_changed');
+            // The identical GitHub concurrency group serializes release of this ref with
+            // the next target job. Never delete another execution's observed lock.
+            await api('DELETE',path(s) + '/git/refs/tags/helio/catalog/' + name);
+          }
+          async function prepare(api,s,plan,target,selection) {
+            if (!envOK(target) || (selection && selection !== target)) fail('target_scope');
+            await assertPlan(api,s,plan,target);
+            const record=await read(api,s,artifactName(s));if(!record)fail('artifact_missing');
+            const artifact=validateArtifact(record.value.artifact), id=operationId(s,target);
+            const receipt=await read(api,s,scopedName('receipts',s,target));
+            if(receipt){
+              if(receipt.value.operation_id!==id || canonical(receipt.value.artifact)!==canonical(artifact))fail('record_conflict');
+              const lock=await read(api,s,'target-locks/'+targetKey(target),true);
+              if(lock?.value.operation_id===id)await unlock(api,s,target,id);
+              return {deploy_required:false,artifact,operation_id:id};
+            }
+            if(await read(api,s,scopedName('intents',s,target)))fail('deployment_uncertain');
+            const intent={...execution(s),environment:target,operation_id:id,artifact,plan_digest:hash(plan)};
+            await put(api,s,'target-locks/'+targetKey(target),intent,true);
+            await put(api,s,scopedName('intents',s,target),intent);
+            return {deploy_required:true,artifact,operation_id:id};
+          }
+          async function complete(api,s,plan,target,observed) {
+            await assertPlan(api,s,plan,target);
+            const intent=await read(api,s,scopedName('intents',s,target));
+            const lock=await read(api,s,'target-locks/'+targetKey(target),true);
+            if(!intent || !lock || lock.value.operation_id!==intent.value.operation_id)fail('target_owner_changed');
+            const value=intent.value;
+            if(observed?.operation_id!==value.operation_id || observed.environment!==target ||
+                observed.observed_artifact_digest!==value.artifact.artifact_digest)fail('deployment_verification');
+            await put(api,s,scopedName('receipts',s,target),{...value,observed_artifact_digest:observed.observed_artifact_digest});
+            await unlock(api,s,target,value.operation_id);
+            return value;
+          }
+          async function main({github,context,core},phase) {
+            const e=process.env;
+            const workflow=(e.GITHUB_WORKFLOW_REF||'').slice((e.GITHUB_REPOSITORY||'').length+1).split('@')[0];
+            const s={repository:e.GITHUB_REPOSITORY,repository_id:String(context.payload.repository.id),workflow_path:workflow,commit:e.GITHUB_SHA,run_id:e.GITHUB_RUN_ID,run_attempt:Number(e.GITHUB_RUN_ATTEMPT)};
+            const api=async(method,url,body)=> (await github.request(method+' '+url,{...body,request:{timeout:10000}})).data;
+            let p;try{p=JSON.parse(e.CATALOG_PLAN);}catch{fail('plan_invalid');}
+            const target=e.TARGET_ENVIRONMENT||'',selection=e.SELECTED_ENVIRONMENT||'';
+            let result;
+            if(phase==='resolve')result=await resolve(api,s,p,selection);
+            else if(phase==='publish'){
+              const artifact=JSON.parse(require('node:fs').readFileSync(e.RESULT_FILE,'utf8'));
+              result={artifact:await publish(api,s,artifact)};
+            } else if(phase==='prepare')result=await prepare(api,s,p,target,selection);
+            else if(phase==='complete'){
+              const observed=JSON.parse(require('node:fs').readFileSync(e.RESULT_FILE,'utf8'));
+              result=await complete(api,s,p,target,observed);
+            } else fail('phase_invalid');
+            for(const [key,value]of Object.entries(result||{}))core.setOutput(key,typeof value==='object'?canonical(value):String(value));
+            if(result.artifact)for(const [key,value]of Object.entries(result.artifact))core.setOutput(key,value);
+          }
+          module.exports={canonical,hash,validatePlan,validateArtifact,resolve,publish,prepare,complete,main};
+
+          })(loaded);
+          await loaded.exports.main({github, context, core}, 'publish');
+        retries: 0
+      env:
+        RESULT_FILE: ${{ runner.temp }}/helio-build-result-${{ github.run_id }}-${{ github.run_attempt }}.json
+      if: ${{ steps.resolve.outputs.build_required == 'true' }}

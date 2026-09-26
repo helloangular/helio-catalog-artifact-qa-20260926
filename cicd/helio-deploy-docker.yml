@@ -1,0 +1,61 @@
+---
+- name: Deploy and inspect the existing immutable image
+  hosts: all
+  gather_facts: false
+  vars:
+    image: "{{ lookup('env', 'ARTIFACT_URI') }}"
+    container_name: "{{ lookup('env', 'CONTAINER_NAME') }}"
+  tasks:
+    - name: Pull the exact digest; never a mutable tag
+      ansible.builtin.command:
+        argv: [docker, pull, "{{ image }}"]
+      changed_when: false
+    - name: Inspect the fetched image
+      ansible.builtin.command:
+        argv: [docker, image, inspect, "{{ image }}"]
+      register: fetched
+      changed_when: false
+    - name: Require the registry identity
+      ansible.builtin.assert:
+        that: image in (fetched.stdout | from_json)[0].RepoDigests
+    - name: Inspect an existing target
+      ansible.builtin.command:
+        argv: [docker, container, inspect, "{{ container_name }}"]
+      register: previous
+      changed_when: false
+      failed_when: previous.rc not in [0, 1]
+    - name: Remove the prior version of this sandbox target only
+      ansible.builtin.command:
+        argv: [docker, container, rm, -f, "{{ container_name }}"]
+      when: previous.rc == 0 and ((previous.stdout | from_json)[0].Image != (fetched.stdout | from_json)[0].Id or not (previous.stdout | from_json)[0].State.Running)
+      changed_when: true
+      register: removed
+    - name: Start the pinned image
+      ansible.builtin.command:
+        argv: [docker, run, -d, --name, "{{ container_name }}", --restart, unless-stopped, --label, "helio.operation_id={{ lookup('env', 'OPERATION_ID') }}", "{{ image }}"]
+      when: previous.rc != 0 or (removed is changed)
+      changed_when: true
+    - name: Read the actual running container
+      ansible.builtin.command:
+        argv: [docker, container, inspect, "{{ container_name }}"]
+      register: running
+      changed_when: false
+    - name: Read that container's image independently
+      ansible.builtin.command:
+        argv: [docker, image, inspect, "{{ (running.stdout | from_json)[0].Image }}"]
+      register: observed
+      changed_when: false
+    - name: Prove the running target has the requested immutable artifact
+      ansible.builtin.assert:
+        that:
+          - (running.stdout | from_json)[0].State.Running
+          - (running.stdout | from_json)[0].Image == (fetched.stdout | from_json)[0].Id
+          - image in (observed.stdout | from_json)[0].RepoDigests
+    - name: Record verified target observation
+      ansible.builtin.copy:
+        dest: "{{ lookup('env', 'RESULT_FILE') }}"
+        mode: '0600'
+        content: >-
+          {{ {'operation_id': lookup('env', 'OPERATION_ID'),
+              'environment': lookup('env', 'TARGET_ENVIRONMENT'),
+              'observed_artifact_digest': ((observed.stdout | from_json)[0].RepoDigests | select('equalto', image) | first).split('@')[1]} | to_json }}
